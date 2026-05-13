@@ -59,6 +59,105 @@ DEFAULT_WEAPON_GAP_CUTOFFS_MS = {
 }
 
 
+def integrate_combat_logs(
+    attack_events: pd.DataFrame,
+    damage_events: pd.DataFrame | None = None,
+    groggy_events: pd.DataFrame | None = None,
+    elimination_events: pd.DataFrame | None = None,
+    flush_events: pd.DataFrame | None = None,
+) -> pd.DataFrame:
+    """Merge generic combat-log tables into a unified event table.
+
+    This is a disclosure-safe version of the event integration step described
+    in the paper. The function assumes that any proprietary source tables have
+    already been converted to de-identified tables with generic column names.
+
+    Parameters
+    ----------
+    attack_events:
+        Firing events. These rows become `event_type == "shot"`.
+    damage_events:
+        Hit/damage events. These rows become `event_type == "hit"`.
+    groggy_events:
+        Incapacitation/down-but-not-out events. These rows become
+        `event_type == "groggy"`.
+    elimination_events:
+        Final elimination events. These rows become
+        `event_type == "final_elimination"`.
+    flush_events:
+        Final eliminations of already incapacitated targets. These rows become
+        `event_type == "flush"`.
+
+    Returns
+    -------
+    pandas.DataFrame
+        A normalized event table sorted by match, player, and time.
+    """
+
+    pieces = []
+
+    def add(frame: pd.DataFrame | None, event_type: str) -> None:
+        if frame is None or frame.empty:
+            return
+        part = frame.copy()
+        part["event_type"] = event_type
+        pieces.append(part)
+
+    add(attack_events, "shot")
+    add(damage_events, "hit")
+    add(groggy_events, "groggy")
+    add(elimination_events, "final_elimination")
+    add(flush_events, "flush")
+    if not pieces:
+        raise ValueError("At least one combat-log table must be provided.")
+    return normalize_event_table(pd.concat(pieces, ignore_index=True, sort=False))
+
+
+def match_outcomes(
+    events: pd.DataFrame,
+    outcome_window_ms: int = 1500,
+) -> pd.DataFrame:
+    """Attach coarse downstream outcome flags to firing/hit events.
+
+    The public implementation uses only generic event types and a short
+    temporal window within the same match, player, and target. It does not
+    expose or depend on proprietary enforcement information.
+    """
+
+    df = normalize_event_table(events)
+    df["has_downstream_groggy"] = False
+    df["has_downstream_final_elimination"] = False
+    df["has_downstream_flush"] = False
+
+    grouped = df.groupby(["match_id", "player_id", "target_id"], dropna=False, sort=False)
+    updates = []
+    for _, part in grouped:
+        part = part.sort_values("event_time_ms")
+        outcome_rows = part[part["event_type"].isin(["groggy", "final_elimination", "flush"])]
+        for idx, row in part.iterrows():
+            if row["event_type"] not in {"shot", "hit"}:
+                continue
+            t0 = int(row["event_time_ms"])
+            nearby = outcome_rows[
+                (outcome_rows["event_time_ms"] >= t0)
+                & (outcome_rows["event_time_ms"] <= t0 + int(outcome_window_ms))
+            ]
+            updates.append(
+                {
+                    "index": idx,
+                    "has_downstream_groggy": bool((nearby["event_type"] == "groggy").any()),
+                    "has_downstream_final_elimination": bool((nearby["event_type"] == "final_elimination").any()),
+                    "has_downstream_flush": bool((nearby["event_type"] == "flush").any()),
+                }
+            )
+
+    for item in updates:
+        idx = item.pop("index")
+        for key, value in item.items():
+            df.at[idx, key] = value
+    return df
+
+
 def normalize_event_table(events: pd.DataFrame) -> pd.DataFrame:
     """Return a normalized event table with safe defaults for optional fields."""
 
@@ -303,4 +402,3 @@ def build_sequence_dataset(
             }
         )
     return pd.DataFrame(rows)
-

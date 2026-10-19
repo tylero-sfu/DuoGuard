@@ -1,179 +1,101 @@
-"""Neural models for the sanitized DuoGuard implementation."""
-
-from __future__ import annotations
-
+"""48-dimensional events -> frozen 64-dimensional sequences -> player score."""
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
+from torch import nn
+from torch.nn import functional as F
+from torch.utils.checkpoint import checkpoint
 
 
-def masked_pool_time_first(x: torch.Tensor, mask: torch.Tensor, first_k: int = 7) -> torch.Tensor:
-    """Concatenate global max/mean and first-k max/mean pooling."""
-
-    if mask is None:
-        mask = torch.ones(x.shape[:2], dtype=torch.bool, device=x.device)
-    mask = mask.bool()
-    mask_f = mask.unsqueeze(-1).float()
-    neg = torch.finfo(x.dtype).min
-
-    global_max = x.masked_fill(~mask.unsqueeze(-1), neg).max(dim=1).values
-    global_mean = (x * mask_f).sum(dim=1) / mask_f.sum(dim=1).clamp_min(1.0)
-
-    first_mask = torch.zeros_like(mask)
-    first_mask[:, : min(first_k, x.shape[1])] = mask[:, : min(first_k, x.shape[1])]
-    first_mask_f = first_mask.unsqueeze(-1).float()
-    first_max = x.masked_fill(~first_mask.unsqueeze(-1), neg).max(dim=1).values
-    first_mean = (x * first_mask_f).sum(dim=1) / first_mask_f.sum(dim=1).clamp_min(1.0)
-
-    return torch.cat([global_max, global_mean, first_max, first_mean], dim=1)
-
-
-class EventFeatureEmbedder(nn.Module):
-    """Embed categorical event features and pass through continuous features."""
-
-    def __init__(
-        self,
-        d_seq: int,
-        categorical_indices: dict[str, int],
-        emb_dim: int = 4,
-        n_damage_regions: int = 7,
-        n_relative_directions: int = 10,
-        n_scopes: int = 8,
-        n_distance_bins: int = 8,
-        n_weapon_categories: int = 9,
-    ):
+class InputEmbedder(nn.Module):
+    def __init__(self):
         super().__init__()
-        self.categorical_indices = dict(categorical_indices)
-        excluded = set(self.categorical_indices.values())
-        self.continuous_indices = [i for i in range(d_seq) if i not in excluded]
+        self.cont_indices = [0, 2, 3, 4, 5, 6, 8, 9, 10, 12, 15]
+        self.scope_emb = nn.Embedding(8, 8)
+        self.dmg_emb = nn.Embedding(7, 8)
+        self.dir_emb = nn.Embedding(10, 8)
+        self.out_dim = 48
 
-        self.damage_emb = nn.Embedding(n_damage_regions, emb_dim)
-        self.direction_emb = nn.Embedding(n_relative_directions, emb_dim)
-        self.scope_emb = nn.Embedding(n_scopes, emb_dim)
-        self.distance_bin_emb = nn.Embedding(n_distance_bins, emb_dim)
-        self.weapon_category_emb = nn.Embedding(n_weapon_categories, emb_dim)
-
-        self.out_dim = len(self.continuous_indices) + 5 * emb_dim
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        parts = [x[:, :, self.continuous_indices]]
-
-        def take(name: str) -> torch.Tensor:
-            return x[:, :, self.categorical_indices[name]].long().clamp_min(0)
-
-        parts.append(self.damage_emb(take("damage_region_code").clamp_max(self.damage_emb.num_embeddings - 1)))
-        parts.append(self.direction_emb(take("relative_direction_code").clamp_max(self.direction_emb.num_embeddings - 1)))
-        parts.append(self.scope_emb(take("scope_code").clamp_max(self.scope_emb.num_embeddings - 1)))
-        parts.append(self.distance_bin_emb(take("distance_bin_code").clamp_max(self.distance_bin_emb.num_embeddings - 1)))
-        parts.append(self.weapon_category_emb(take("weapon_category_code").clamp_max(self.weapon_category_emb.num_embeddings - 1)))
-        return torch.cat(parts, dim=-1)
+    def forward(self, x):
+        distance = F.one_hot(x[:, :, 7].long().clamp(0, 5), 6).to(x.dtype)
+        distance = distance * x[:, :, 8:9]
+        weapon = F.one_hot(x[:, :, 14].long().clamp(0, 6), 7).to(x.dtype)
+        return torch.cat([x[:, :, self.cont_indices], self.scope_emb(x[:, :, 1].long()),
+                          self.dmg_emb(x[:, :, 13].long()), self.dir_emb(x[:, :, 11].long()),
+                          distance, weapon], dim=-1)
 
 
-class DuoGuardSequenceEncoder(nn.Module):
-    """Dual-view sequence encoder used to produce sequence embeddings."""
-
-    def __init__(
-        self,
-        d_seq: int,
-        d_stat: int,
-        n_weapons: int,
-        categorical_indices: dict[str, int],
-        emb_dim: int = 4,
-        hidden_dim: int = 128,
-        sequence_embedding_dim: int = 160,
-        first_k: int = 7,
-    ):
+class SequenceCore(nn.Module):
+    def __init__(self):
         super().__init__()
-        self.first_k = int(first_k)
-        self.event_embedder = EventFeatureEmbedder(d_seq=d_seq, categorical_indices=categorical_indices, emb_dim=emb_dim)
-        self.weapon_embedding = nn.Embedding(n_weapons, emb_dim)
-        event_dim = self.event_embedder.out_dim + emb_dim
+        self.embedder = InputEmbedder()
+        self.lstm = nn.LSTM(48, 64, batch_first=True)
 
-        self.lstm = nn.LSTM(input_size=event_dim, hidden_size=hidden_dim, batch_first=True)
-        self.stat_mlp = nn.Sequential(
-            nn.Linear(d_stat, 64),
-            nn.BatchNorm1d(64),
-            nn.ReLU(),
-            nn.Linear(64, 64),
-            nn.ReLU(),
-        )
-        self.fusion = nn.Linear(hidden_dim * 4 + 64, sequence_embedding_dim)
-        self.sequence_head = nn.Sequential(
-            nn.Linear(sequence_embedding_dim, 64),
-            nn.ReLU(),
-            nn.Dropout(0.3),
-            nn.Linear(64, 1),
-        )
-
-    def encode(self, x_seq: torch.Tensor, x_stat: torch.Tensor, weapon_idx: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-        event_emb = self.event_embedder(x_seq)
-        w = self.weapon_embedding(weapon_idx.long()).unsqueeze(1).expand(-1, x_seq.shape[1], -1)
-        event_emb = torch.cat([event_emb, w], dim=-1)
-        out, _ = self.lstm(event_emb)
-        temporal = masked_pool_time_first(out, mask, first_k=self.first_k)
-        stat = self.stat_mlp(x_stat)
-        return self.fusion(torch.cat([temporal, stat], dim=1))
-
-    def forward(self, x_seq: torch.Tensor, x_stat: torch.Tensor, weapon_idx: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-        z = self.encode(x_seq, x_stat, weapon_idx, mask)
-        return self.sequence_head(z).squeeze(-1)
+    def forward(self, x, lengths):
+        if x.ndim != 3 or x.shape[-1] != 16:
+            raise ValueError("Expected [sequences, shots, 16]")
+        if lengths.shape != (len(x),) or not bool(((lengths > 0) & (lengths <= x.shape[1])).all()):
+            raise ValueError("Invalid sequence lengths")
+        output, _ = self.lstm(self.embedder(x))
+        return output[torch.arange(len(x), device=x.device), lengths.long() - 1]
 
 
-class PlayerRiskClassifier(nn.Module):
-    """Player-level classifier over a variable-size bag of sequence embeddings."""
-
-    def __init__(self, embedding_dim: int = 160, pooling: str = "mean", hidden_dim: int = 128, top_pct: float = 25.0):
+class SequenceClassifier(nn.Module):
+    def __init__(self):
         super().__init__()
-        if pooling not in {"mean", "max", "attention", "top_percent"}:
-            raise ValueError(f"Unsupported pooling: {pooling}")
-        self.pooling = pooling
-        self.top_pct = float(top_pct)
-        self.attention = nn.Sequential(nn.Linear(embedding_dim, 64), nn.Tanh(), nn.Linear(64, 1))
-        self.top_score = nn.Linear(embedding_dim, 1)
-        self.classifier = nn.Sequential(
-            nn.Linear(embedding_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(0.3),
-            nn.Linear(hidden_dim, 1),
-        )
+        self.encoder = SequenceCore()
+        self.head = nn.Sequential(nn.Linear(64, 64), nn.ReLU(), nn.Dropout(.3), nn.Linear(64, 1))
 
-    def pool(self, embeddings: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    def forward(self, x, lengths):
+        return self.head(self.encoder(x, lengths)).squeeze(-1)
+
+
+class TemporalAttention(nn.Module):
+    def __init__(self, recurrent_chunk=2048):
+        super().__init__()
+        if recurrent_chunk < 1:
+            raise ValueError("recurrent_chunk must be positive")
+        self.recurrent_chunk = recurrent_chunk
+        self.lstm = nn.LSTM(65, 64, batch_first=True)
+        self.attention = nn.Sequential(nn.Linear(64, 32), nn.Tanh(), nn.Linear(32, 1))
+        self.classifier = nn.Sequential(nn.Linear(64, 64), nn.LayerNorm(64), nn.ReLU(),
+                                        nn.Dropout(.3), nn.Linear(64, 1))
+
+    def _chunk(self, x, h, c):
+        out, (hn, cn) = self.lstm(x, (h, c))
+        return out, hn, cn
+
+    def forward_features(self, x, match_start, mask):
         mask = mask.bool()
-        if self.pooling == "mean":
-            denom = mask.unsqueeze(-1).float().sum(dim=1).clamp_min(1.0)
-            return (embeddings * mask.unsqueeze(-1).float()).sum(dim=1) / denom
-        if self.pooling == "max":
-            neg = torch.finfo(embeddings.dtype).min
-            return embeddings.masked_fill(~mask.unsqueeze(-1), neg).max(dim=1).values
-        if self.pooling == "attention":
-            logits = self.attention(embeddings).squeeze(-1).masked_fill(~mask, -1e9)
-            alpha = torch.softmax(logits, dim=1)
-            return (embeddings * alpha.unsqueeze(-1)).sum(dim=1)
+        if x.ndim != 3 or x.shape[-1] != 64 or mask.shape != x.shape[:2] or match_start.shape != mask.shape:
+            raise ValueError("Invalid player bag shapes")
+        if not bool(mask.any(1).all()) or bool((mask[:, 1:] & ~mask[:, :-1]).any()):
+            raise ValueError("Bags must be nonempty with right padding only")
+        z = torch.cat([x, match_start.unsqueeze(-1).to(x.dtype)], -1)
+        h = x.new_zeros(1, len(x), 64)
+        c = torch.zeros_like(h)
+        running_max = denom = numer = None
+        # Preserve recurrent state and global attention across computational chunks.
+        for start in range(0, z.shape[1], self.recurrent_chunk):
+            piece = z[:, start:start + self.recurrent_chunk]
+            if self.training and torch.is_grad_enabled():
+                out, h, c = checkpoint(self._chunk, piece, h, c, use_reentrant=False)
+            else:
+                out, h, c = self._chunk(piece, h, c)
+            valid = mask[:, start:start + self.recurrent_chunk]
+            energy = self.attention(out).squeeze(-1).masked_fill(~valid, -torch.inf)
+            chunk_max = energy.max(1).values
+            if running_max is None:
+                running_max = chunk_max
+                weight = torch.exp(energy - running_max[:, None]).masked_fill(~valid, 0)
+                denom = weight.sum(1)
+                numer = (weight.unsqueeze(-1) * out).sum(1)
+            else:
+                new_max = torch.maximum(running_max, chunk_max)
+                old_scale = torch.exp(running_max - new_max)
+                weight = torch.exp(energy - new_max[:, None]).masked_fill(~valid, 0)
+                denom = denom * old_scale + weight.sum(1)
+                numer = numer * old_scale[:, None] + (weight.unsqueeze(-1) * out).sum(1)
+                running_max = new_max
+        return numer / denom[:, None]
 
-        scores = self.top_score(embeddings).squeeze(-1).masked_fill(~mask, -1e9)
-        lengths = mask.sum(dim=1).clamp_min(1)
-        ks = torch.ceil(lengths.float() * max(0.0, min(self.top_pct, 100.0)) / 100.0).long().clamp_min(1)
-        k_max = int(ks.max().item())
-        idx = scores.topk(k=k_max, dim=1).indices
-        selected = embeddings.gather(1, idx.unsqueeze(-1).expand(-1, -1, embeddings.shape[-1]))
-        selected_mask = mask.gather(1, idx)
-        rank_mask = torch.arange(k_max, device=embeddings.device).unsqueeze(0) < ks.unsqueeze(1)
-        weight = (selected_mask & rank_mask).unsqueeze(-1).float()
-        return (selected * weight).sum(dim=1) / weight.sum(dim=1).clamp_min(1.0)
-
-    def forward(self, embeddings: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-        pooled = self.pool(embeddings, mask)
-        return self.classifier(pooled).squeeze(-1)
-
-
-def default_categorical_indices(sequence_features: list[str]) -> dict[str, int]:
-    names = [
-        "damage_region_code",
-        "relative_direction_code",
-        "scope_code",
-        "distance_bin_code",
-        "weapon_category_code",
-    ]
-    return {name: sequence_features.index(name) for name in names}
-
+    def forward(self, x, match_start, mask):
+        return self.classifier(self.forward_features(x, match_start, mask)).squeeze(-1)

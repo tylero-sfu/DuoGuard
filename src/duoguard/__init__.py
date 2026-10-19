@@ -1,11 +1,3 @@
-"""Sanitized DuoGuard implementation package."""
+"""DuoGuard research implementation with externally supplied labels."""
 
-from .features import SEQUENCE_FEATURES, STATISTICAL_FEATURES
-from .models import DuoGuardSequenceEncoder, PlayerRiskClassifier
-
-__all__ = [
-    "SEQUENCE_FEATURES",
-    "STATISTICAL_FEATURES",
-    "DuoGuardSequenceEncoder",
-    "PlayerRiskClassifier",
-]
+__version__ = "2.0.0"

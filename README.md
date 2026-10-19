@@ -1,143 +1,123 @@
 # DuoGuard
 
-This repository contains the anonymous research implementation package for
-DuoGuard, a weakly supervised framework for shooting-assistance cheating-risk
-scoring from server-side combat telemetry in battle royale shooters.
+Portable implementation of the revised DuoGuard main model. Labels and split
+assignments are supplied by the user; this package does not construct them.
 
-The package is intended for anonymous review and inspection of the method
-pipeline. It provides the public, disclosure-safe parts of the implementation:
+The model encodes each shooting sequence with a 64-unit LSTM, freezes the selected
+encoder, and processes chronological sequence embeddings using a second 64-unit
+LSTM and attention pooling. A match-start flag accompanies each sequence embedding.
+Each stage selects its checkpoint by validation AUPRC. The final threshold
+maximizes validation F1 over 0.01 through 0.99 in steps of 0.01.
 
-- PUBG API-style combat telemetry conversion into the generic event schema,
-- combat-log integration and outcome matching,
-- shooting-sequence construction,
-- distance interpolation,
-- event-level tensor and statistical descriptor construction,
-- the dual-view sequence encoder,
-- player-level bag aggregation models,
-- evaluation metrics and threshold selection,
-- plotting helpers, and
-- a small synthetic demo.
+## Install
 
-The repository does **not** include proprietary gameplay telemetry, player
-identifiers, operational enforcement records, ban/action taxonomies, internal
-label curation rules, or code for constructing player labels. Training labels
-are expected to be supplied externally as a de-identified table with columns
-such as `player_id`, `label`, and `split`.
+Python 3.10 or later and PyTorch 2.1 or later are required. CPU execution is
+sufficient for the included example.
 
-## Repository Layout
-
-```text
-configs/
-  duoguard_default.json
-docs/
-  preprocessing_pipeline.md
-  pubg_api_adapter.md
-examples/
-  synthetic_events.csv
-  synthetic_player_labels.csv
-scripts/
-  build_sequences.py
-  run_table_pipeline.py
-  run_synthetic_demo.py
-src/duoguard/
-  evaluation.py
-  features.py
-  models.py
-  plotting.py
-  preprocessing.py
-  pubg_api_adapter.py
-  training.py
+```bash
+python -m pip install -e .
 ```
 
-## What Is Publicly Implemented?
+## Quick smoke test
 
-The public pipeline follows the same high-level structure as the manuscript:
-
-```text
-PUBG API-style combat events or generic combat-event table
-  -> combat-log integration and outcome matching
-  -> weapon-aware shooting-sequence segmentation
-  -> distance interpolation
-  -> T=32 event tensor and statistical descriptor construction
-  -> dual-view sequence encoder
-  -> sequence embedding extraction
-  -> player-level mean-pooling aggregation
-  -> player-level risk score and evaluation metrics
+```bash
+python scripts/run_synthetic_demo.py --output-dir outputs/smoke
+python -m unittest discover -s tests -v
 ```
 
-The package therefore exposes how combat telemetry is transformed into
-shooting sequences and model inputs. It intentionally does not expose how
-operator-derived labels were created.
+The smoke test regenerates the existing synthetic example, trains both stages
+for one epoch, evaluates six artificial test windows, and checks that reloading
+the model preserves scores. It checks the frozen encoder and parameter counts:
+33,609 for Stage 1, 40,002 for Stage 2, and 69,386 for inference without the
+auxiliary sequence head. The normal configuration uses five epochs per stage.
+Use a new output directory for each training run.
 
-## Quick Start
+The toy records are generated independently of the research data. Toy scores
+demonstrate execution, not the paper's numerical results. Some tiny example
+windows have only one class; undefined metrics are reported as null, not zero.
+
+## Existing example CSV workflow
 
 ```bash
 python examples/generate_synthetic_data.py
-python scripts/run_synthetic_demo.py
-```
-
-The demo builds short shooting sequences from synthetic combat events, trains
-a small DuoGuard-style sequence encoder, aggregates sequence embeddings by
-player with mean pooling, and reports player-level metrics.
-The synthetic files are toy examples only. They are not sampled from, derived
-from, or statistically fitted to the proprietary telemetry used in the paper.
-
-For a table-driven run that more closely follows the paper pipeline:
-
-```bash
 python scripts/run_table_pipeline.py \
   --events examples/synthetic_events.csv \
   --labels examples/synthetic_player_labels.csv \
-  --output-dir outputs/table_pipeline_demo
+  --output-dir outputs/example --device cpu
 ```
 
-This command builds shooting sequences, trains the sequence encoder, extracts
-sequence embeddings, trains the player-level classifier, and writes metrics and
-predictions. With private data, replace the two input files with de-identified
-event and player-label tables that follow the documented schema.
+The existing filenames and label CSV interface are retained. The legacy example
+contains one row per shot with its outcome already attached. It is not a set of
+separate raw attack/damage records. All-miss sequences are retained. See
+[input schema](docs/input_schema.md) for the canonical research input route.
 
-## Data Interface
+## Preprocessed research input
 
-The public code supports two input paths. First, de-identified tabular combat
-events can be provided directly with the generic schema documented in
-`src/duoguard/preprocessing.py`. Second, PUBG API-style combat telemetry can be
-converted into this generic schema with `src/duoguard/pubg_api_adapter.py`.
-The adapter covers combat-log events only and excludes all operational
-enforcement or label-construction logic.
+For existing preprocessed data, provide the 16 canonical features directly,
+without recomputing them through the toy adapter. The sequence NPZ contains raw
+(not standardized) features, lengths, and ordering metadata. Labels remain in a
+separate CSV. No pickle is needed for data input.
 
-The PUBG API-style adapter recognizes the following public combat event names:
-
-```text
-LogPlayerAttack
-LogPlayerTakeDamage
-LogPlayerMakeGroggy
-LogPlayerKill
-LogPlayerKillV2
+```bash
+python scripts/run_table_pipeline.py \
+  --sequences data/sequences.npz --labels data/player_labels.csv \
+  --output-dir outputs/main --device cuda:0
 ```
 
-Operational label construction is intentionally excluded. To train on a private
-dataset, provide a separate label table:
+Alternatively, a CSV with all 16 canonical feature columns and sequence metadata
+can use `--events`. A supplied `sequence_id` preserves sequence membership.
+`scripts/build_sequences.py` converts this table into the portable NPZ format.
 
-```text
-player_id,label,split
-p0001,0,train
-p0002,1,train
-p0003,0,valid
+Training-only statistics standardize the continuous input columns. Development
+bags group an account's complete supplied development history. Test bags are
+separate for each `test_window`; repeated test accounts are allowed across windows,
+but training, validation, and test account sets must be disjoint. The input must
+place test observations after the development observation period.
+
+## Outputs and inference
+
+Training writes `encoder_best.pt`, `player_best.pt`, `inference.pt`, `scaler.json`,
+the resolved configuration, validation/test predictions, and `metrics.json`.
+The latter includes the selected epochs and weekly, equal-weight, and pooled
+test metrics. If test data are absent, no test score is fabricated.
+
+```bash
+python scripts/predict.py --sequences data/sequences.npz \
+  --model-dir outputs/main --output outputs/inference.csv
+
+python scripts/evaluate.py --predictions outputs/main/test_predictions.csv \
+  --threshold 0.45 --bootstrap 1000 --output outputs/ci.json
 ```
 
-where `label` is a weak player-level supervision signal.
-
-## Synthetic Data
-
-The files in `examples/` are small artificial examples for exercising the code
-path. They are not sampled from, derived from, or statistically fitted to the
-proprietary telemetry used in the study. They are included only so that the
-preprocessing, training, and evaluation scripts can be run without private data.
+Replace `0.45` with the threshold in your run's `metrics.json`. Evaluation never
+selects a threshold from test data. The bootstrap samples account IDs and retains
+all observations of a sampled account across windows. It estimates uncertainty
+in the equal-weight mean of weekly AUPRC and F1, not retraining variability.
+Use only trusted, locally generated model checkpoints.
 
 ## Scope
 
-This code is a disclosure-safe research implementation of the methods described
-in the paper. It is not a production anti-cheat system and is not intended for
-automatic punitive action. The private study used proprietary telemetry exports
-and operator-derived labels; those materials are not redistributed in this
-package.
+This release implements the main two-stage training and inference path and its
+fixed-prediction evaluation. It does not claim to reproduce every comparison
+table: the other encoder families, ML/MIL baselines, joint-training experiments,
+and operational follow-up analysis are not implemented in this package.
+
+The canonical input route preserves the reported model computations. The legacy
+CSV adapter supports the synthetic example; it does not reconstruct unavailable
+movement measurements or proprietary raw-event integrations. A public API parser
+is not included because API-style records alone are not a verified substitute
+for the canonical feature input.
+
+This is an in-memory reference runner. Large datasets require account-complete
+batching/sharding around the same model and evaluation interfaces. The recurrent
+chunk option limits activation memory without truncating player history, but does
+not make the input loader an out-of-core production pipeline. Different batch
+sizes, hardware, and stochastic training can produce different fitted models.
+
+Reproducing the reported numerical results requires the original dataset, which
+is not publicly available. No real telemetry, account labels, enforcement records,
+label-construction rules, or fitted research checkpoints are distributed.
+
+## License
+
+MIT; see [LICENSE](LICENSE).

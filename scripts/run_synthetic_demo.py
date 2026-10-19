@@ -1,84 +1,62 @@
-from __future__ import annotations
-
-import sys
+"""CPU smoke test: data -> two-stage training -> saved-model inference."""
+import argparse
+import json
 from pathlib import Path
+import runpy
+import sys
+import tempfile
 
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / 'src'))
 import numpy as np
 import pandas as pd
 import torch
-
-ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / "src"))
-
-from duoguard.features import SEQUENCE_FEATURES, STATISTICAL_FEATURES
-from duoguard.preprocessing import DEFAULT_WEAPON_GAP_CUTOFFS_MS, SequenceConfig, build_sequence_dataset
-from duoguard.training import (
-    TrainingConfig,
-    extract_sequence_embeddings,
-    score_player_embeddings,
-    train_player_classifier,
-    train_sequence_encoder,
-)
-from duoguard.evaluation import binary_metrics
+from duoguard.data import save_sequences
+from duoguard.preprocessing import build_sequence_dataset
+from duoguard.training import fit, predict
 
 
-def assign_weapon_indices(frame: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, int]]:
-    vocab = {w: i for i, w in enumerate(sorted(frame["weapon_id"].astype(str).unique()))}
-    out = frame.copy()
-    out["weapon_idx"] = out["weapon_id"].astype(str).map(vocab).astype(int)
-    return out, vocab
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--output-dir', type=Path, default=ROOT / 'outputs/smoke')
+    parser.add_argument('--epochs', type=int, default=1, help='Smoke-only override; manuscript default is 5')
+    args = parser.parse_args()
+    torch.set_num_threads(1)
+    # Run the existing generator in a temporary directory, without changing inputs.
+    generator = runpy.run_path(str(ROOT / 'examples/generate_synthetic_data.py'))
+    with tempfile.TemporaryDirectory() as temp:
+        generator['main'].__globals__['ROOT'] = Path(temp)
+        generator['main']()
+        events = pd.read_csv(Path(temp) / 'synthetic_events.csv')
+        labels = pd.read_csv(Path(temp) / 'synthetic_player_labels.csv')
+    roles = labels.set_index('player_id')['split']
+    events['test_window'] = ''
+    test = events['player_id'].map(roles).eq('test')
+    events.loc[test, 'test_window'] = events.loc[test, 'match_id'].str[1:].astype(int).mod(6).map(lambda i: f'week_{i + 1}')
+    x, lengths, meta = build_sequence_dataset(events, labels)
+    cfg = json.loads((ROOT / 'configs/duoguard_default.json').read_text())
+    cfg.update(encoder_epochs=args.epochs, player_epochs=args.epochs, batch_size=32,
+               player_batch_size=4, recurrent_chunk=8)
+    save_sequences(args.output_dir / 'synthetic_sequences.npz', x, lengths, meta)
+    report = fit(x, lengths, meta, labels, cfg, args.output_dir)
+    prediction = predict(x, lengths, meta, args.output_dir, batch_size=32, player_batch_size=4)
+    test_saved = pd.read_csv(args.output_dir / 'test_predictions.csv', keep_default_na=False)
+    merged = test_saved.merge(prediction, on=['account_id', 'test_window'], suffixes=('_saved', '_reloaded'), validate='one_to_one')
+    assert len(merged) == len(test_saved)
+    np.testing.assert_allclose(merged['score_saved'], merged['score_reloaded'], rtol=1e-5, atol=1e-6)
+    assert report['parameters'] == {'stage1': 33609, 'stage2': 40002, 'inference': 69386}
+    assert len(report['test']['weekly']) == 6
+    assert report['encoder_frozen_verified']
+    for stage, key in [('sequence', 'encoder_best_epoch'), ('player', 'player_best_epoch')]:
+        rows = [r for r in report['history'] if r['stage'] == stage]
+        assert max(rows, key=lambda r: r['validation_auprc'])['epoch'] == report[key]
+    prediction.to_csv(args.output_dir / 'reloaded_predictions.csv', index=False)
+    result = {'status': 'PASS', 'synthetic_only': True, 'sequences': len(x),
+              'test_windows': 6, 'parameters': report['parameters'],
+              'frozen_encoder': True, 'checkpoint_reload_scores_match': True}
+    (args.output_dir / 'smoke_result.json').write_text(json.dumps(result, indent=2) + '\n')
+    print(json.dumps(result, indent=2))
 
 
-def main() -> None:
-    np.random.seed(7)
-    torch.manual_seed(7)
-
-    events = pd.read_csv(ROOT / "examples" / "synthetic_events.csv")
-    labels = pd.read_csv(ROOT / "examples" / "synthetic_player_labels.csv")
-
-    seq_cfg = SequenceConfig(
-        max_sequence_length=32,
-        first_k=7,
-        weapon_gap_cutoffs_ms=DEFAULT_WEAPON_GAP_CUTOFFS_MS,
-    )
-    sequences = build_sequence_dataset(events, config=seq_cfg)
-    sequences = sequences.merge(labels, on="player_id", how="inner")
-    sequences, weapon_vocab = assign_weapon_indices(sequences)
-
-    # The synthetic file is tiny. Duplicate rows only to exercise the training
-    # loop; real experiments should use the original de-identified sequence rows.
-    sequences = pd.concat([sequences] * 32, ignore_index=True)
-    train_df = sequences[sequences["split"] == "train"].reset_index(drop=True)
-    valid_df = sequences[sequences["split"] == "valid"].reset_index(drop=True)
-
-    cfg = TrainingConfig(
-        encoder_epochs=1,
-        player_epochs=1,
-        batch_size=16,
-        player_batch_size=8,
-        device="cuda" if torch.cuda.is_available() else "cpu",
-    )
-
-    encoder = train_sequence_encoder(
-        train_df=train_df,
-        valid_df=valid_df,
-        sequence_features=SEQUENCE_FEATURES,
-        d_stat=len(STATISTICAL_FEATURES),
-        n_weapons=max(1, len(weapon_vocab)),
-        cfg=cfg,
-    )
-    train_emb = extract_sequence_embeddings(encoder, train_df, SEQUENCE_FEATURES, batch_size=32)
-    valid_emb = extract_sequence_embeddings(encoder, valid_df, SEQUENCE_FEATURES, batch_size=32)
-    player_model, threshold, valid_metrics = train_player_classifier(train_emb, valid_emb, cfg=cfg, pooling="mean")
-    y, scores = score_player_embeddings(player_model, valid_emb, cfg=cfg)
-    metrics = binary_metrics(y, scores, threshold)
-
-    print("weapon_vocab:", weapon_vocab)
-    print("n_sequences:", len(sequences))
-    print("validation_threshold:", round(threshold, 3))
-    print("validation_metrics:", {k: round(v, 4) for k, v in metrics.items()})
-
-
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
-

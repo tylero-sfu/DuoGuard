@@ -1,174 +1,222 @@
-"""Compact training utilities for the sanitized DuoGuard implementation."""
-
-from __future__ import annotations
-
-from dataclasses import dataclass
+"""Two-stage training with validation-only checkpoint and threshold selection."""
+import copy
+import json
+from pathlib import Path
+import random
 
 import numpy as np
 import pandas as pd
 import torch
-import torch.nn as nn
-from torch.utils.data import DataLoader, Dataset
+from torch import nn
+from torch.utils.data import DataLoader, Dataset, TensorDataset
 
-from .evaluation import binary_metrics, select_threshold_by_f1
-from .models import DuoGuardSequenceEncoder, PlayerRiskClassifier, default_categorical_indices
-
-
-@dataclass
-class TrainingConfig:
-    encoder_epochs: int = 3
-    player_epochs: int = 3
-    encoder_lr: float = 5e-4
-    player_lr: float = 1e-3
-    batch_size: int = 256
-    player_batch_size: int = 128
-    device: str = "cuda" if torch.cuda.is_available() else "cpu"
+from .data import FeatureScaler, attach_external_labels
+from .evaluation import binary_metrics, select_threshold_by_f1, weekly_report
+from .models import SequenceClassifier, SequenceCore, TemporalAttention
 
 
-class SequenceDataset(Dataset):
-    def __init__(self, frame: pd.DataFrame, sequence_features: list[str]):
-        self.frame = frame.reset_index(drop=True)
-        self.sequence_features = sequence_features
+def seed_everything(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
-    def __len__(self) -> int:
-        return len(self.frame)
 
-    def __getitem__(self, idx: int):
-        row = self.frame.iloc[idx]
-        return {
-            "x_seq": torch.tensor(row["x_seq"], dtype=torch.float32),
-            "x_stat": torch.tensor(row["x_stat"], dtype=torch.float32),
-            "mask": torch.tensor(row["mask"], dtype=torch.bool),
-            "weapon_idx": torch.tensor(int(row.get("weapon_idx", 0)), dtype=torch.long),
-            "label": torch.tensor(float(row["label"]), dtype=torch.float32),
-        }
+def cpu_state(module):
+    return {key: value.detach().cpu().clone() for key, value in module.state_dict().items()}
+
+
+def save_json(path, value):
+    Path(path).write_text(json.dumps(value, indent=2, allow_nan=False) + '\n')
 
 
 class PlayerBagDataset(Dataset):
-    def __init__(self, embeddings: pd.DataFrame):
+    def __init__(self, embeddings, meta):
+        self.embeddings = embeddings
         self.rows = []
-        for player_id, part in embeddings.groupby("player_id", sort=False):
-            z = np.stack(part["embedding"].to_numpy())
-            label = float(part["label"].iloc[0])
-            self.rows.append((player_id, z, label))
+        indexed = meta.reset_index(drop=True).copy()
+        indexed['_index'] = np.arange(len(indexed))
+        for (player, window), group in indexed.groupby(['player_id', 'test_window'], sort=True):
+            group = group.sort_values(['sequence_start_ms', 'match_id', 'sequence_id'], kind='stable')
+            match = group['match_id'].to_numpy()
+            flags = np.concatenate([[True], match[1:] != match[:-1]])
+            target = float(group['label'].iloc[0]) if 'label' in group else -1.
+            self.rows.append((str(player), str(window), group['_index'].to_numpy(), flags, target))
 
-    def __len__(self) -> int:
+    def __len__(self):
         return len(self.rows)
 
-    def __getitem__(self, idx: int):
-        player_id, z, label = self.rows[idx]
-        return player_id, torch.tensor(z, dtype=torch.float32), torch.tensor(label, dtype=torch.float32)
+    def __getitem__(self, index):
+        player, window, ids, flags, target = self.rows[index]
+        return player, window, self.embeddings[ids], flags, target
 
 
-def collate_player_bags(batch):
-    player_ids, bags, labels = zip(*batch)
-    max_len = max(b.shape[0] for b in bags)
-    dim = bags[0].shape[1]
-    x = torch.zeros((len(bags), max_len, dim), dtype=torch.float32)
-    mask = torch.zeros((len(bags), max_len), dtype=torch.bool)
-    for i, bag in enumerate(bags):
-        x[i, : bag.shape[0], :] = bag
-        mask[i, : bag.shape[0]] = True
-    return player_ids, x, mask, torch.stack(labels)
-
-
-def train_sequence_encoder(
-    train_df: pd.DataFrame,
-    valid_df: pd.DataFrame,
-    sequence_features: list[str],
-    d_stat: int,
-    n_weapons: int,
-    cfg: TrainingConfig | None = None,
-) -> DuoGuardSequenceEncoder:
-    cfg = cfg or TrainingConfig()
-    device = torch.device(cfg.device)
-    model = DuoGuardSequenceEncoder(
-        d_seq=len(sequence_features),
-        d_stat=d_stat,
-        n_weapons=n_weapons,
-        categorical_indices=default_categorical_indices(sequence_features),
-    ).to(device)
-    opt = torch.optim.AdamW(model.parameters(), lr=cfg.encoder_lr, weight_decay=1e-4)
-    pos = max(1.0, float(train_df["label"].sum()))
-    neg = max(1.0, float((1 - train_df["label"]).sum()))
-    criterion = nn.BCEWithLogitsLoss(pos_weight=torch.tensor([neg / pos], device=device))
-
-    loader = DataLoader(SequenceDataset(train_df, sequence_features), batch_size=cfg.batch_size, shuffle=True)
-    for _ in range(cfg.encoder_epochs):
-        model.train()
-        for batch in loader:
-            opt.zero_grad(set_to_none=True)
-            logits = model(
-                batch["x_seq"].to(device),
-                batch["x_stat"].to(device),
-                batch["weapon_idx"].to(device),
-                batch["mask"].to(device),
-            )
-            loss = criterion(logits, batch["label"].to(device))
-            loss.backward()
-            opt.step()
-    return model
+def collate_bags(rows):
+    max_length = max(len(row[2]) for row in rows)
+    x = torch.zeros(len(rows), max_length, 64)
+    flags = torch.zeros(len(rows), max_length, dtype=torch.bool)
+    mask = torch.zeros_like(flags)
+    for i, row in enumerate(rows):
+        n = len(row[2])
+        x[i, :n] = torch.as_tensor(row[2])
+        flags[i, :n] = torch.as_tensor(row[3])
+        mask[i, :n] = True
+    return [r[0] for r in rows], [r[1] for r in rows], x, flags, mask, torch.tensor([r[4] for r in rows])
 
 
 @torch.no_grad()
-def extract_sequence_embeddings(model: DuoGuardSequenceEncoder, frame: pd.DataFrame, sequence_features: list[str], batch_size: int = 512) -> pd.DataFrame:
-    device = next(model.parameters()).device
-    loader = DataLoader(SequenceDataset(frame, sequence_features), batch_size=batch_size, shuffle=False)
-    rows = []
-    start = 0
+def extract_embeddings(encoder, x, lengths, batch_size, device):
+    encoder.eval()
+    result = []
+    for start in range(0, len(x), batch_size):
+        result.append(encoder(torch.from_numpy(x[start:start + batch_size]).to(device),
+                              torch.from_numpy(lengths[start:start + batch_size]).to(device)).cpu().numpy())
+    return np.concatenate(result)
+
+
+@torch.no_grad()
+def score_sequences(model, loader, device):
     model.eval()
-    for batch in loader:
-        z = model.encode(
-            batch["x_seq"].to(device),
-            batch["x_stat"].to(device),
-            batch["weapon_idx"].to(device),
-            batch["mask"].to(device),
-        ).cpu().numpy()
-        for j, emb in enumerate(z):
-            row = frame.iloc[start + j]
-            rows.append({"player_id": row["player_id"], "sequence_id": row["sequence_id"], "embedding": emb, "label": row["label"]})
-        start += len(z)
+    targets, scores = [], []
+    for x, lengths, y in loader:
+        scores.extend(model(x.to(device), lengths.to(device)).sigmoid().cpu().tolist())
+        targets.extend(y.tolist())
+    return np.asarray(targets), np.asarray(scores)
+
+
+@torch.no_grad()
+def score_players(model, loader, device):
+    model.eval()
+    rows = []
+    for ids, windows, x, flags, mask, targets in loader:
+        scores = model(x.to(device), flags.to(device), mask.to(device)).sigmoid().cpu().numpy()
+        for i, player in enumerate(ids):
+            rows.append({'account_id': player, 'test_window': windows[i], 'target': int(targets[i]),
+                         'score': float(scores[i]), 'n_seq': int(mask[i].sum())})
     return pd.DataFrame(rows)
 
 
-def train_player_classifier(
-    train_embeddings: pd.DataFrame,
-    valid_embeddings: pd.DataFrame,
-    cfg: TrainingConfig | None = None,
-    pooling: str = "mean",
-) -> tuple[PlayerRiskClassifier, float, dict[str, float]]:
-    cfg = cfg or TrainingConfig()
-    device = torch.device(cfg.device)
-    emb_dim = len(train_embeddings["embedding"].iloc[0])
-    model = PlayerRiskClassifier(embedding_dim=emb_dim, pooling=pooling).to(device)
-    opt = torch.optim.AdamW(model.parameters(), lr=cfg.player_lr, weight_decay=1e-4)
-    criterion = nn.BCEWithLogitsLoss()
+def fit(x, lengths, meta, labels, cfg, output_dir, device='cpu'):
+    output = Path(output_dir)
+    output.mkdir(parents=True, exist_ok=True)
+    if any(output.glob('*.pt')):
+        raise ValueError('Output contains checkpoints; use a new directory')
+    cfg = copy.deepcopy(cfg)
+    for key in ['encoder_epochs', 'player_epochs', 'batch_size', 'player_batch_size', 'recurrent_chunk']:
+        if int(cfg[key]) < 1:
+            raise ValueError(key + ' must be positive')
+    seed_everything(int(cfg['seed']))
+    meta = attach_external_labels(meta, labels)
+    train = meta['split'].eq('train').to_numpy()
+    valid = meta['split'].eq('valid').to_numpy()
+    test = meta['split'].eq('test').to_numpy()
+    scaler = FeatureScaler().fit(x[train], lengths[train])
+    x = scaler.transform(x, lengths)
+    scaler.save(output / 'scaler.json')
+    save_json(output / 'config.json', cfg)
 
-    train_loader = DataLoader(PlayerBagDataset(train_embeddings), batch_size=cfg.player_batch_size, shuffle=True, collate_fn=collate_player_bags)
-    for _ in range(cfg.player_epochs):
+    def sequence_loader(select, shuffle=False):
+        dataset = TensorDataset(torch.from_numpy(x[select]), torch.from_numpy(lengths[select]),
+                                torch.tensor(meta.loc[select, 'label'].to_numpy(), dtype=torch.float32))
+        return DataLoader(dataset, batch_size=cfg['batch_size'], shuffle=shuffle)
+
+    model = SequenceClassifier().to(device)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=cfg['encoder_learning_rate'], weight_decay=cfg['weight_decay'])
+    targets = meta.loc[train, 'label'].to_numpy()
+    positive_weight = float((targets == 0).sum() / (targets == 1).sum())
+    criterion = nn.BCEWithLogitsLoss(pos_weight=torch.tensor(positive_weight, device=device))
+    train_loader, valid_loader = sequence_loader(train, True), sequence_loader(valid)
+    history = []
+    best_ap = -1.
+    best_encoder = None
+    for epoch in range(1, cfg['encoder_epochs'] + 1):
         model.train()
-        for _, x, mask, y in train_loader:
-            opt.zero_grad(set_to_none=True)
-            logits = model(x.to(device), mask.to(device))
-            loss = criterion(logits, y.to(device))
+        for batch_x, batch_lengths, y in train_loader:
+            optimizer.zero_grad(set_to_none=True)
+            loss = criterion(model(batch_x.to(device), batch_lengths.to(device)), y.to(device))
             loss.backward()
-            opt.step()
+            nn.utils.clip_grad_norm_(model.parameters(), cfg['gradient_clip'], error_if_nonfinite=True)
+            optimizer.step()
+        y, scores = score_sequences(model, valid_loader, device)
+        ap = binary_metrics(y, scores, .5)['auprc']
+        record = {'stage': 'sequence', 'epoch': epoch, 'validation_auprc': ap}
+        history.append(record)
+        print(json.dumps(record), flush=True)
+        if ap > best_ap:
+            best_ap, best_encoder = ap, epoch
+            torch.save({'model': cpu_state(model), 'epoch': epoch, 'validation_auprc': ap,
+                        'positive_weight': positive_weight}, output / 'encoder_best.pt')
+    saved = torch.load(output / 'encoder_best.pt', map_location='cpu', weights_only=True)
+    model.load_state_dict(saved['model'])
+    encoder = model.encoder.eval().requires_grad_(False)
+    for parameter in encoder.parameters():
+        parameter.grad = None
+    initial_encoder = cpu_state(encoder)
+    embeddings = extract_embeddings(encoder, x, lengths, cfg['batch_size'], device)
 
-    y_valid, s_valid = score_player_embeddings(model, valid_embeddings, cfg=cfg)
-    threshold, _ = select_threshold_by_f1(y_valid, s_valid)
-    return model, threshold, binary_metrics(y_valid, s_valid, threshold)
+    def player_loader(select, shuffle=False):
+        dataset = PlayerBagDataset(embeddings[select], meta.loc[select].reset_index(drop=True))
+        return DataLoader(dataset, batch_size=cfg['player_batch_size'], shuffle=shuffle, collate_fn=collate_bags)
+
+    player = TemporalAttention(cfg['recurrent_chunk']).to(device)
+    optimizer = torch.optim.AdamW(player.parameters(), lr=cfg['player_learning_rate'], weight_decay=cfg['weight_decay'])
+    criterion = nn.BCEWithLogitsLoss()
+    train_loader, valid_loader = player_loader(train, True), player_loader(valid)
+    best_ap, best_player = -1., None
+    for epoch in range(1, cfg['player_epochs'] + 1):
+        player.train()
+        for _, _, z, flags, mask, y in train_loader:
+            optimizer.zero_grad(set_to_none=True)
+            loss = criterion(player(z.to(device), flags.to(device), mask.to(device)), y.to(device))
+            loss.backward()
+            nn.utils.clip_grad_norm_(player.parameters(), cfg['gradient_clip'], error_if_nonfinite=True)
+            optimizer.step()
+        prediction = score_players(player, valid_loader, device)
+        ap = binary_metrics(prediction['target'], prediction['score'], .5)['auprc']
+        record = {'stage': 'player', 'epoch': epoch, 'validation_auprc': ap}
+        history.append(record)
+        print(json.dumps(record), flush=True)
+        if ap > best_ap:
+            best_ap, best_player = ap, epoch
+            torch.save({'model': cpu_state(player), 'epoch': epoch, 'validation_auprc': ap}, output / 'player_best.pt')
+    saved = torch.load(output / 'player_best.pt', map_location='cpu', weights_only=True)
+    player.load_state_dict(saved['model'])
+    validation = score_players(player, valid_loader, device)
+    threshold = select_threshold_by_f1(validation['target'], validation['score'])
+    validation.to_csv(output / 'validation_predictions.csv', index=False)
+    if any(not torch.equal(initial_encoder[k], v.cpu()) for k, v in encoder.state_dict().items()):
+        raise RuntimeError('Frozen encoder changed during Stage 2')
+    if any(p.grad is not None for p in encoder.parameters()):
+        raise RuntimeError('Frozen encoder accumulated gradients')
+    torch.save({'encoder': cpu_state(encoder), 'player': cpu_state(player), 'threshold': threshold,
+                'recurrent_chunk': cfg['recurrent_chunk']}, output / 'inference.pt')
+    report = {'encoder_best_epoch': best_encoder, 'player_best_epoch': best_player,
+              'threshold': threshold, 'validation': binary_metrics(validation['target'], validation['score'], threshold),
+              'parameters': {'stage1': sum(p.numel() for p in model.parameters()),
+                             'stage2': sum(p.numel() for p in player.parameters()),
+                             'inference': sum(p.numel() for p in encoder.parameters()) + sum(p.numel() for p in player.parameters())},
+              'encoder_frozen_verified': True, 'history': history}
+    if test.any():
+        prediction = score_players(player, player_loader(test), device)
+        prediction.to_csv(output / 'test_predictions.csv', index=False)
+        report['test'] = weekly_report(prediction, threshold)
+    else:
+        report['test'] = None
+    save_json(output / 'metrics.json', report)
+    return report
 
 
-@torch.no_grad()
-def score_player_embeddings(model: PlayerRiskClassifier, embeddings: pd.DataFrame, cfg: TrainingConfig | None = None) -> tuple[np.ndarray, np.ndarray]:
-    cfg = cfg or TrainingConfig()
-    device = torch.device(cfg.device)
-    loader = DataLoader(PlayerBagDataset(embeddings), batch_size=cfg.player_batch_size, shuffle=False, collate_fn=collate_player_bags)
-    y_true, scores = [], []
-    model.eval()
-    for _, x, mask, y in loader:
-        logits = model(x.to(device), mask.to(device))
-        y_true.extend(y.numpy().astype(int).tolist())
-        scores.extend(torch.sigmoid(logits).cpu().numpy().tolist())
-    return np.asarray(y_true), np.asarray(scores)
-
+def predict(x, lengths, meta, model_dir, device='cpu', batch_size=256, player_batch_size=32):
+    model_dir = Path(model_dir)
+    saved = torch.load(model_dir / 'inference.pt', map_location='cpu', weights_only=True)
+    encoder = SequenceCore().to(device)
+    player = TemporalAttention(saved['recurrent_chunk']).to(device)
+    encoder.load_state_dict(saved['encoder'])
+    player.load_state_dict(saved['player'])
+    x = FeatureScaler.load(model_dir / 'scaler.json').transform(x, lengths)
+    embeddings = extract_embeddings(encoder, x, lengths, batch_size, device)
+    loader = DataLoader(PlayerBagDataset(embeddings, meta), batch_size=player_batch_size, collate_fn=collate_bags)
+    prediction = score_players(player, loader, device).drop(columns='target')
+    prediction['prediction'] = (prediction['score'] >= saved['threshold']).astype(int)
+    return prediction
